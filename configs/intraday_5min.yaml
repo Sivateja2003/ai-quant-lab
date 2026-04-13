@@ -1,0 +1,21 @@
+pipeline_name: "intraday_5min_fetch"
+description: "Fetch 5-minute intraday candles for top liquid stocks"
+
+data_source:
+  api: "kite_connect"
+  exchange: "NSE"
+  instruments:
+    - "RELIANCE"
+    - "HDFCBANK"
+    - "TCS"
+    - "INFY"
+    - "ICICIBANK"
+
+date_range:
+  start: "2025-01-01"
+  end: "2026-04-10"
+  interval: "5minute"
+
+retry:
+  max_attempts: 3
+  backoff_seconds: 2
