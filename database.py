@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 from contextlib import contextmanager
 
@@ -118,6 +118,21 @@ def get_db_connection():
 # Table DDL
 # ---------------------------------------------------------------------------
 
+_CREATE_STOCK_DATA_SQL = """
+CREATE TABLE IF NOT EXISTS stock_data (
+    instrument_token INT            NOT NULL,
+    symbol           VARCHAR(50)    NOT NULL,
+    timestamp        DATETIME       NOT NULL,
+    open             DECIMAL(12, 4) NOT NULL,
+    high             DECIMAL(12, 4) NOT NULL,
+    low              DECIMAL(12, 4) NOT NULL,
+    close            DECIMAL(12, 4) NOT NULL,
+    volume           BIGINT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (instrument_token, timestamp),
+    INDEX idx_symbol_ts (symbol, timestamp)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 _CREATE_FETCH_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS fetch_log (
     symbol        VARCHAR(50)  NOT NULL,
@@ -177,10 +192,10 @@ WINDOW w AS (PARTITION BY symbol ORDER BY timestamp);
 
 
 def ensure_table() -> None:
-    """Verify stock_data is accessible and create tables + enriched view if needed."""
+    """Create stock_data and supporting tables/views if they don't exist."""
     conn   = _get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM stock_data LIMIT 1")
+    cursor.execute(_CREATE_STOCK_DATA_SQL)
     cursor.execute(_CREATE_FETCH_LOG_SQL)
     cursor.execute(_CREATE_PIPELINE_ERRORS_SQL)
     # Add extra columns only if they don't exist (compatible with older MySQL)
@@ -197,6 +212,11 @@ def ensure_table() -> None:
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def ensure_extended_tables() -> None:
+    """Alias kept for pipeline.py compatibility — delegates to ensure_table()."""
+    ensure_table()
 
 
 def log_pipeline_error(
@@ -238,6 +258,52 @@ def log_pipeline_error(
     conn.close()
 
 
+def push_to_dlq(
+    symbol: str,
+    exchange: str,
+    interval: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    error_msg: str,
+    pipeline_name: str,
+) -> int:
+    """
+    Insert a failed fetch into pipeline_errors (dead-letter queue).
+    Returns the inserted row id, or -1 on failure.
+    """
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return -1
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO pipeline_errors
+                    (source, symbol, exchange, interval_type,
+                     from_date, to_date, error_type, error_message, config_file)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    pipeline_name,
+                    symbol.upper(),
+                    exchange.upper(),
+                    interval,
+                    from_dt.date(),
+                    to_dt.date(),
+                    "FetchError",
+                    error_msg,
+                    pipeline_name,
+                ),
+            )
+            row_id = cursor.lastrowid
+            conn.commit()
+            cursor.close()
+            return row_id
+    except Exception as exc:
+        logger.error("push_to_dlq error for %s: %s", symbol, exc)
+        return -1
+
+
 def data_exists(
     symbol: str,
     exchange: str,
@@ -274,6 +340,79 @@ def data_exists(
     except Exception as exc:
         logger.error(f"data_exists: {exc}")
         return False
+
+
+def _date_to_dt(d: date, is_start: bool) -> datetime:
+    """Convert a date to start-of-day or end-of-day datetime."""
+    if is_start:
+        return datetime(d.year, d.month, d.day, 0, 0, 0)
+    return datetime(d.year, d.month, d.day, 23, 59, 59)
+
+
+def find_missing_date_ranges(
+    symbol: str,
+    exchange: str,
+    interval: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """
+    Return (start, end) datetime pairs not yet covered in fetch_log for this
+    symbol/exchange/interval within [from_dt, to_dt].
+
+    Example: if 2025-01-01→2025-06-30 is already logged and the requested
+    range is 2025-01-01→2026-04-10, only [(2025-07-01, 2026-04-10)] is returned.
+    """
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return [(from_dt, to_dt)]
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT from_date, to_date FROM fetch_log
+                 WHERE symbol        = %s
+                   AND exchange      = %s
+                   AND interval_type = %s
+                   AND from_date     <= %s
+                   AND to_date       >= %s
+                 ORDER BY from_date
+                """,
+                (
+                    symbol.upper(),
+                    exchange.upper(),
+                    interval,
+                    to_dt.date(),
+                    from_dt.date(),
+                ),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+    except Exception as exc:
+        logger.error("find_missing_date_ranges error for %s: %s", symbol, exc)
+        return [(from_dt, to_dt)]
+
+    if not rows:
+        return [(from_dt, to_dt)]
+
+    covered = sorted((r["from_date"], r["to_date"]) for r in rows)
+
+    gaps: list[tuple[datetime, datetime]] = []
+    current = from_dt.date()
+    end_date = to_dt.date()
+
+    for cov_start, cov_end in covered:
+        if current < cov_start:
+            gap_end = min(cov_start - timedelta(days=1), end_date)
+            gaps.append((_date_to_dt(current, True), _date_to_dt(gap_end, False)))
+        current = max(current, cov_end + timedelta(days=1))
+        if current > end_date:
+            break
+
+    if current <= end_date:
+        gaps.append((_date_to_dt(current, True), _date_to_dt(end_date, False)))
+
+    return gaps
 
 
 def transform(df: pd.DataFrame) -> pd.DataFrame:
