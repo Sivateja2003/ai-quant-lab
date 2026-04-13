@@ -118,21 +118,6 @@ def get_db_connection():
 # Table DDL
 # ---------------------------------------------------------------------------
 
-_CREATE_STOCK_DATA_SQL = """
-CREATE TABLE IF NOT EXISTS stock_data (
-    instrument_token INT            NOT NULL,
-    symbol           VARCHAR(50)    NOT NULL,
-    timestamp        DATETIME       NOT NULL,
-    open             DECIMAL(12, 4) NOT NULL,
-    high             DECIMAL(12, 4) NOT NULL,
-    low              DECIMAL(12, 4) NOT NULL,
-    close            DECIMAL(12, 4) NOT NULL,
-    volume           BIGINT         NOT NULL DEFAULT 0,
-    PRIMARY KEY (instrument_token, timestamp),
-    INDEX idx_symbol_ts (symbol, timestamp)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-"""
-
 _CREATE_FETCH_LOG_SQL = """
 CREATE TABLE IF NOT EXISTS fetch_log (
     symbol        VARCHAR(50)  NOT NULL,
@@ -192,10 +177,10 @@ WINDOW w AS (PARTITION BY symbol ORDER BY timestamp);
 
 
 def ensure_table() -> None:
-    """Create stock_data and supporting tables/views if they don't exist."""
+    """Verify stock_data is accessible and create supporting tables/views if needed."""
     conn   = _get_connection()
     cursor = conn.cursor()
-    cursor.execute(_CREATE_STOCK_DATA_SQL)
+    cursor.execute("SELECT 1 FROM stock_data LIMIT 1")
     cursor.execute(_CREATE_FETCH_LOG_SQL)
     cursor.execute(_CREATE_PIPELINE_ERRORS_SQL)
     # Add extra columns only if they don't exist (compatible with older MySQL)
