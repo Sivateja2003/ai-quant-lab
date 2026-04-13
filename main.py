@@ -16,7 +16,6 @@ python main.py --symbol "NIFTY 50" --from 2025-03-24 --to 2025-03-31 \
 """
 
 import argparse
-import logging
 import os
 import sys
 
@@ -25,8 +24,6 @@ import pandas as pd
 from auth import get_authenticated_kite
 from fetcher import fetch_historical_data, VALID_INTERVALS, _to_datetime
 from database import ensure_table, data_exists, save_to_db
-
-logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,57 +81,58 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-
     parser = build_parser()
     args = parser.parse_args()
+    print("[DEBUG] Arguments parsed successfully")
 
     symbol   = args.symbol
     exchange = args.exchange.upper()
     interval = args.interval
 
+    # Parse dates once so we can reuse them for both DB checks and the API call
     from_dt = _to_datetime(args.from_date, is_start=True)
     to_dt   = _to_datetime(args.to_date,   is_start=False)
-    logger.info("Date range: %s to %s", from_dt.date(), to_dt.date())
+    print(f"[DEBUG] Date range: {from_dt} to {to_dt}")
 
+    # Ensure the MySQL table exists
+    print("[DEBUG] Initializing database...")
     ensure_table()
+    print("[DEBUG] Database table ready")
 
     if data_exists(symbol, exchange, interval, from_dt, to_dt):
-        logger.info("Data already in database — skipping fetch.")
+        print("Data is already present in the database.")
         sys.exit(0)
-
-    logger.info("Data not in DB — fetching from Kite API.")
-    kite = get_authenticated_kite()
-    df, instrument_token = fetch_historical_data(
-        kite=kite,
-        symbol=symbol,
-        from_date=from_dt,
-        to_date=to_dt,
-        interval=interval,
-        exchange=exchange,
-        continuous=args.continuous,
-        oi=args.oi,
-    )
+    else:
+        print("[DEBUG] Data not found in DB, fetching from Kite API...")
+        kite = get_authenticated_kite()
+        df, instrument_token = fetch_historical_data(
+            kite=kite,
+            symbol=symbol,
+            from_date=from_dt,
+            to_date=to_dt,
+            interval=interval,
+            exchange=exchange,
+            continuous=args.continuous,
+            oi=args.oi,
+        )
+        if not df.empty:
+            rows_saved = save_to_db(df, symbol, instrument_token, exchange, interval, from_dt, to_dt)
+            print(f"Saved {rows_saved} candle(s) to the stock_data table.")
 
     if df.empty:
-        logger.warning("No data returned. Nothing saved.")
+        print("No data to display.")
         sys.exit(0)
 
-    rows_saved = save_to_db(df, symbol, instrument_token, exchange, interval, from_dt, to_dt)
-    logger.info("Saved %d candle(s) to stock_data.", rows_saved)
-
+    # Display a preview
     pd.set_option("display.max_rows", 20)
     pd.set_option("display.float_format", "{:.2f}".format)
     print("\n" + df.to_string())
 
+    # Optionally save to CSV
     if args.output:
         out_path = os.path.join(os.path.dirname(__file__), args.output)
         df.to_csv(out_path)
-        logger.info("Saved to %s", out_path)
+        print(f"\nSaved to {out_path}")
 
 
 if __name__ == "__main__":
