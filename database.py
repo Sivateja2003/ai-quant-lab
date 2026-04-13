@@ -23,6 +23,8 @@ from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 from contextlib import contextmanager
 
+import json
+
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -541,15 +543,45 @@ CREATE TABLE IF NOT EXISTS watched_symbols (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+_CREATE_TICK_DATA_SQL = """
+CREATE TABLE IF NOT EXISTS tick_data (
+    id                   BIGINT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+    instrument_token     INT              NOT NULL,
+    symbol               VARCHAR(50)      NOT NULL,
+    exchange             VARCHAR(20)      NOT NULL DEFAULT '',
+    captured_at          DATETIME(3)      NOT NULL,
+    last_price           DECIMAL(14, 4)   NOT NULL,
+    open                 DECIMAL(14, 4),
+    high                 DECIMAL(14, 4),
+    low                  DECIMAL(14, 4),
+    close                DECIMAL(14, 4),
+    volume               BIGINT           DEFAULT 0,
+    buy_quantity         INT              DEFAULT 0,
+    sell_quantity        INT              DEFAULT 0,
+    change_pct           DECIMAL(10, 4),
+    last_traded_quantity INT              DEFAULT 0,
+    avg_traded_price     DECIMAL(14, 4),
+    oi                   BIGINT           DEFAULT 0,
+    oi_day_high          BIGINT           DEFAULT 0,
+    oi_day_low           BIGINT           DEFAULT 0,
+    last_trade_time      DATETIME(3),
+    exchange_timestamp   DATETIME(3),
+    depth                JSON,
+    INDEX idx_symbol_captured (symbol, captured_at),
+    INDEX idx_token_captured  (instrument_token, captured_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 
 def ensure_tick_tables() -> None:
-    """Create watched_symbols table if it does not exist."""
+    """Create watched_symbols and tick_data tables if they do not exist."""
     try:
         with get_db_connection() as conn:
             if not conn:
                 return
             cursor = conn.cursor()
             cursor.execute(_CREATE_WATCHED_SYMBOLS_SQL)
+            cursor.execute(_CREATE_TICK_DATA_SQL)
             conn.commit()
             cursor.close()
     except Exception as exc:
@@ -621,7 +653,7 @@ def remove_watched_symbol(symbol: str, exchange: str = "NSE") -> bool:
 
 def save_ticks(ticks: list[dict]) -> int:
     """
-    Bulk-insert real-time 1-second tick snapshots into stock_data.
+    Bulk-insert real-time tick snapshots into tick_data.
     Returns number of rows inserted.
     """
     if not ticks:
@@ -634,21 +666,46 @@ def save_ticks(ticks: list[dict]) -> int:
                 return 0
             cursor = conn.cursor()
             for t in ticks:
+                depth = t.get("depth")
                 cursor.execute(
                     """
-                    INSERT IGNORE INTO stock_data
-                        (instrument_token, symbol, timestamp, open, high, low, close, volume)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO tick_data
+                        (instrument_token, symbol, exchange, captured_at,
+                         last_price, open, high, low, close,
+                         volume, buy_quantity, sell_quantity, change_pct,
+                         last_traded_quantity, avg_traded_price,
+                         oi, oi_day_high, oi_day_low,
+                         last_trade_time, exchange_timestamp, depth)
+                    VALUES
+                        (%s, %s, %s, %s,
+                         %s, %s, %s, %s, %s,
+                         %s, %s, %s, %s,
+                         %s, %s,
+                         %s, %s, %s,
+                         %s, %s, %s)
                     """,
                     (
                         int(t["instrument_token"]),
                         t["symbol"].upper(),
+                        t.get("exchange", ""),
                         t["captured_at"],
-                        float(t["open"])  if t.get("open")  is not None else float(t["last_price"]),
-                        float(t["high"])  if t.get("high")  is not None else float(t["last_price"]),
-                        float(t["low"])   if t.get("low")   is not None else float(t["last_price"]),
                         float(t["last_price"]),
+                        float(t["open"])             if t.get("open")             is not None else None,
+                        float(t["high"])             if t.get("high")             is not None else None,
+                        float(t["low"])              if t.get("low")              is not None else None,
+                        float(t["close"])            if t.get("close")            is not None else None,
                         int(t.get("volume") or 0),
+                        int(t.get("buy_quantity") or 0),
+                        int(t.get("sell_quantity") or 0),
+                        float(t["change"])           if t.get("change")           is not None else None,
+                        int(t.get("last_traded_quantity") or 0),
+                        float(t["avg_traded_price"]) if t.get("avg_traded_price") is not None else None,
+                        int(t.get("oi") or 0),
+                        int(t.get("oi_day_high") or 0),
+                        int(t.get("oi_day_low") or 0),
+                        t.get("last_trade_time"),
+                        t.get("exchange_timestamp"),
+                        json.dumps(depth) if depth is not None else None,
                     ),
                 )
                 rows_inserted += cursor.rowcount
