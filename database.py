@@ -573,8 +573,42 @@ CREATE TABLE IF NOT EXISTS tick_data (
 """
 
 
+_CREATE_INSTRUMENT_MASTER_SQL = """
+CREATE TABLE IF NOT EXISTS instrument_master (
+    instrument_token INT            NOT NULL,
+    exchange         VARCHAR(20)    NOT NULL,
+    tradingsymbol    VARCHAR(50)    NOT NULL,
+    name             VARCHAR(100),
+    expiry           DATE,
+    strike           DECIMAL(14, 4),
+    tick_size        DECIMAL(10, 4),
+    lot_size         INT,
+    instrument_type  VARCHAR(20),
+    segment          VARCHAR(20),
+    exchange_token   INT,
+    last_price       DECIMAL(14, 4),
+    updated_at       DATETIME       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (instrument_token, exchange),
+    INDEX idx_exchange_symbol (exchange, tradingsymbol)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+_CREATE_ORDER_UPDATES_SQL = """
+CREATE TABLE IF NOT EXISTS order_updates (
+    id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    order_id      VARCHAR(50),
+    status        VARCHAR(50),
+    tradingsymbol VARCHAR(50),
+    exchange      VARCHAR(20),
+    raw_data      JSON,
+    received_at   DATETIME        DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_order_id (order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
 def ensure_tick_tables() -> None:
-    """Create watched_symbols and tick_data tables if they do not exist."""
+    """Create watched_symbols, tick_data, instrument_master, order_updates if they do not exist."""
     try:
         with get_db_connection() as conn:
             if not conn:
@@ -582,6 +616,8 @@ def ensure_tick_tables() -> None:
             cursor = conn.cursor()
             cursor.execute(_CREATE_WATCHED_SYMBOLS_SQL)
             cursor.execute(_CREATE_TICK_DATA_SQL)
+            cursor.execute(_CREATE_INSTRUMENT_MASTER_SQL)
+            cursor.execute(_CREATE_ORDER_UPDATES_SQL)
             conn.commit()
             cursor.close()
     except Exception as exc:
@@ -716,3 +752,108 @@ def save_ticks(ticks: list[dict]) -> int:
         logger.error(f"save_ticks: {exc}")
 
     return rows_inserted
+
+
+def get_instruments_for_exchange(exchange: str) -> list[dict]:
+    """Return cached instruments for an exchange from instrument_master."""
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return []
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT instrument_token, tradingsymbol FROM instrument_master WHERE exchange = %s",
+                (exchange.upper(),),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            return rows
+    except Exception as exc:
+        logger.error(f"get_instruments_for_exchange: {exc}")
+        return []
+
+
+def upsert_instruments(exchange: str, instruments: list[dict]) -> int:
+    """Upsert a list of instruments from kite.instruments() into instrument_master."""
+    if not instruments:
+        return 0
+    count = 0
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return 0
+            cursor = conn.cursor()
+            for inst in instruments:
+                expiry = inst.get("expiry")
+                if expiry and str(expiry) in ("0000-00-00", ""):
+                    expiry = None
+                cursor.execute(
+                    """
+                    INSERT INTO instrument_master
+                        (instrument_token, exchange, tradingsymbol, name,
+                         expiry, strike, tick_size, lot_size,
+                         instrument_type, segment, exchange_token, last_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        tradingsymbol   = VALUES(tradingsymbol),
+                        name            = VALUES(name),
+                        expiry          = VALUES(expiry),
+                        strike          = VALUES(strike),
+                        tick_size       = VALUES(tick_size),
+                        lot_size        = VALUES(lot_size),
+                        instrument_type = VALUES(instrument_type),
+                        segment         = VALUES(segment),
+                        exchange_token  = VALUES(exchange_token),
+                        last_price      = VALUES(last_price),
+                        updated_at      = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        int(inst.get("instrument_token", 0)),
+                        exchange.upper(),
+                        inst.get("tradingsymbol", ""),
+                        inst.get("name", ""),
+                        expiry or None,
+                        float(inst["strike"])       if inst.get("strike")       else None,
+                        float(inst["tick_size"])    if inst.get("tick_size")    else None,
+                        int(inst["lot_size"])       if inst.get("lot_size")     else None,
+                        inst.get("instrument_type", ""),
+                        inst.get("segment", ""),
+                        int(inst["exchange_token"]) if inst.get("exchange_token") else None,
+                        float(inst["last_price"])   if inst.get("last_price")   else None,
+                    ),
+                )
+                count += 1
+            conn.commit()
+            cursor.close()
+    except Exception as exc:
+        logger.error(f"upsert_instruments: {exc}")
+    return count
+
+
+def save_order_update(data: dict) -> int:
+    """Persist a Kite WebSocket order-update event to order_updates. Returns row id."""
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return -1
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO order_updates (order_id, status, tradingsymbol, exchange, raw_data)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    data.get("order_id", ""),
+                    data.get("status", ""),
+                    data.get("tradingsymbol", ""),
+                    data.get("exchange", ""),
+                    json.dumps(data),
+                ),
+            )
+            row_id = cursor.lastrowid
+            conn.commit()
+            cursor.close()
+            return row_id
+    except Exception as exc:
+        logger.error(f"save_order_update: {exc}")
+        return -1
