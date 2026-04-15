@@ -1,12 +1,13 @@
 """
 Unified entry point for ai-quant-lab.
 
-Dispatches to one of four modes:
+Dispatches to one of five modes:
 
-  server    Start the FastAPI HTTP server via uvicorn
-  pipeline  Run a config-driven YAML batch-fetch pipeline
-  fetch     Fetch historical data for a single symbol (CLI)
-  ticker    Stream live NIFTY 50 tick data into tick_data (runs until Ctrl+C)
+  server     Start the FastAPI HTTP server via uvicorn
+  pipeline   Run a config-driven YAML batch-fetch pipeline
+  fetch      Fetch historical data for a single symbol (CLI)
+  ticker     Stream live NIFTY 50 tick data into tick_data (runs until Ctrl+C)
+  simulator  Start the Kite WebSocket Simulator + management API (no Zerodha needed)
 
 Usage
 -----
@@ -16,6 +17,8 @@ Usage
                         [--interval day] [--exchange NSE] [--output FILE.csv]
                         [--oi] [--continuous]
     python run.py ticker [--mode full|quote|ltp] [--workers N]
+    python run.py simulator [--host 0.0.0.0] [--port 8765] [--force-open]
+                            [--mgmt-port 8766]
 """
 
 from __future__ import annotations
@@ -52,20 +55,84 @@ def _run_pipeline(args: argparse.Namespace) -> None:
     run_pipeline(cfg, dry_run=args.dry_run, workers=args.workers)
 
 
+def _run_simulator(args: argparse.Namespace) -> None:
+    """
+    Start the Kite Simulator WebSocket server and (optionally) the management API.
+
+    The simulator broadcasts realistic tick frames without a Zerodha subscription.
+    Set KITE_USE_SIMULATOR=true in .env and run this to test the full pipeline locally.
+    """
+    import threading
+    import sys
+    import os
+
+    # Ensure the simulator package is importable
+    sim_dir = os.path.join(os.path.dirname(__file__), "simulator")
+    if sim_dir not in sys.path:
+        sys.path.insert(0, sim_dir)
+
+    # Start management API in a background thread (optional but convenient)
+    if args.mgmt_port:
+        try:
+            import uvicorn
+            from simulator.management_api import app as mgmt_app
+
+            def _run_mgmt():
+                uvicorn.run(
+                    mgmt_app,
+                    host=args.host,
+                    port=args.mgmt_port,
+                    log_config=None,
+                )
+
+            t = threading.Thread(target=_run_mgmt, name="mgmt-api", daemon=True)
+            t.start()
+            print(
+                f"Management API started → http://{args.host}:{args.mgmt_port}/docs\n"
+                f"  Create a key: POST http://{args.host}:{args.mgmt_port}/keys"
+            )
+        except ImportError:
+            print("WARNING: uvicorn not installed — management API not started.")
+
+    # Start the simulator WebSocket server (blocking)
+    print(
+        f"\nKite Simulator → ws://{args.host}:{args.port}"
+        + ("  [force-open mode]" if args.force_open else "")
+    )
+    print("Press Ctrl+C to stop.\n")
+
+    import asyncio
+    from simulator.kite_simulator import _main as sim_main
+
+    try:
+        asyncio.run(sim_main(args.host, args.port, args.force_open,
+                             from_timestamp=getattr(args, "from_timestamp", None),
+                             to_timestamp=getattr(args, "to_timestamp", None)))
+    except KeyboardInterrupt:
+        print("\nSimulator stopped.")
+
+
 def _run_ticker(args: argparse.Namespace) -> None:
     import signal
     import time
     from database import ensure_tick_tables
-    from ws_ticker import WsTickerManager
 
     ensure_tick_tables()
 
-    manager = WsTickerManager(mode=args.mode, num_workers=args.workers)
+    if getattr(args, "sim", False):
+        from ws_ticker_sim import SimTickerManager
+        manager = SimTickerManager()
+        source = "Kite Simulator"
+    else:
+        from ws_ticker import WsTickerManager
+        manager = WsTickerManager(mode=args.mode, num_workers=args.workers)
+        source = "Zerodha KiteTicker"
+
     manager.start_scheduler()   # auto-start at 09:15 IST, auto-stop at 15:30 IST
 
     # Also start immediately if called manually outside scheduler
     status = manager.start()
-    print(f"Ticker {status}. Streaming live NIFTY 50 tick data → tick_data table.")
+    print(f"Ticker {status}. Streaming from {source} → tick_data table.")
     print("Press Ctrl+C to stop.\n")
 
     stop_event = False
@@ -162,6 +229,35 @@ def _build_parser() -> argparse.ArgumentParser:
         "--workers", "-w", type=int, default=2, metavar="N",
         help="Parallel DB-writer threads (default: 2)",
     )
+    tk.add_argument(
+        "--sim", action="store_true",
+        help="Use the Kite Simulator instead of real Zerodha KiteTicker",
+    )
+
+    # ── simulator ─────────────────────────────────────────────────────────────
+    sm = sub.add_parser(
+        "simulator",
+        help="Start the Kite WebSocket Simulator (no Zerodha subscription needed)",
+        description=(
+            "Launch the local Kite Simulator WebSocket server. "
+            "Set KITE_USE_SIMULATOR=true in .env so the ticker connects to it "
+            "instead of the real Zerodha KiteTicker."
+        ),
+    )
+    sm.add_argument("--host",       default="0.0.0.0",
+                    help="Bind host (default: 0.0.0.0)")
+    sm.add_argument("--port",       type=int, default=8765,
+                    help="WebSocket port (default: 8765)")
+    sm.add_argument("--force-open", action="store_true",
+                    help="Always stream live ticks regardless of IST time / holidays")
+    sm.add_argument("--mgmt-port",  type=int, default=8766, metavar="PORT",
+                    help="Management API port (default: 8766, 0 to disable)")
+    sm.add_argument("--from",       dest="from_timestamp", default=None,
+                    metavar="TIMESTAMP",
+                    help="Start replay from this timestamp, e.g. '2024-06-01' or '2024-06-01 09:15:00'")
+    sm.add_argument("--to",         dest="to_timestamp",   default=None,
+                    metavar="TIMESTAMP",
+                    help="Stop replay at this timestamp, e.g. '2024-06-01' or '2024-06-01 15:30:00'")
 
     # ── fetch ─────────────────────────────────────────────────────────────────
     fe = sub.add_parser(
@@ -205,3 +301,5 @@ if __name__ == "__main__":
         _run_fetch(args)
     elif args.command == "ticker":
         _run_ticker(args)
+    elif args.command == "simulator":
+        _run_simulator(args)

@@ -42,7 +42,12 @@ from database import (
     get_watched_symbols, add_watched_symbol, remove_watched_symbol,
     get_enriched_candles,
 )
-from ws_ticker import ws_ticker_manager as ticker_manager
+
+import os
+if os.getenv("KITE_USE_SIMULATOR", "false").lower() == "true":
+    from ws_ticker_sim import ticker_manager
+else:
+    from ws_ticker import ws_ticker_manager as ticker_manager
 
 logger = logging.getLogger(__name__)
 
