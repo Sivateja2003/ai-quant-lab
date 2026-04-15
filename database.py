@@ -19,9 +19,11 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from urllib.parse import urlparse
 from contextlib import contextmanager
+
+import json
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -177,7 +179,7 @@ WINDOW w AS (PARTITION BY symbol ORDER BY timestamp);
 
 
 def ensure_table() -> None:
-    """Verify stock_data is accessible and create tables + enriched view if needed."""
+    """Verify stock_data is accessible and create supporting tables/views if needed."""
     conn   = _get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM stock_data LIMIT 1")
@@ -197,6 +199,11 @@ def ensure_table() -> None:
     conn.commit()
     cursor.close()
     conn.close()
+
+
+def ensure_extended_tables() -> None:
+    """Alias kept for pipeline.py compatibility — delegates to ensure_table()."""
+    ensure_table()
 
 
 def log_pipeline_error(
@@ -238,6 +245,52 @@ def log_pipeline_error(
     conn.close()
 
 
+def push_to_dlq(
+    symbol: str,
+    exchange: str,
+    interval: str,
+    from_dt: datetime,
+    to_dt: datetime,
+    error_msg: str,
+    pipeline_name: str,
+) -> int:
+    """
+    Insert a failed fetch into pipeline_errors (dead-letter queue).
+    Returns the inserted row id, or -1 on failure.
+    """
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return -1
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO pipeline_errors
+                    (source, symbol, exchange, interval_type,
+                     from_date, to_date, error_type, error_message, config_file)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    pipeline_name,
+                    symbol.upper(),
+                    exchange.upper(),
+                    interval,
+                    from_dt.date(),
+                    to_dt.date(),
+                    "FetchError",
+                    error_msg,
+                    pipeline_name,
+                ),
+            )
+            row_id = cursor.lastrowid
+            conn.commit()
+            cursor.close()
+            return row_id
+    except Exception as exc:
+        logger.error("push_to_dlq error for %s: %s", symbol, exc)
+        return -1
+
+
 def data_exists(
     symbol: str,
     exchange: str,
@@ -274,6 +327,79 @@ def data_exists(
     except Exception as exc:
         logger.error(f"data_exists: {exc}")
         return False
+
+
+def _date_to_dt(d: date, is_start: bool) -> datetime:
+    """Convert a date to start-of-day or end-of-day datetime."""
+    if is_start:
+        return datetime(d.year, d.month, d.day, 0, 0, 0)
+    return datetime(d.year, d.month, d.day, 23, 59, 59)
+
+
+def find_missing_date_ranges(
+    symbol: str,
+    exchange: str,
+    interval: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """
+    Return (start, end) datetime pairs not yet covered in fetch_log for this
+    symbol/exchange/interval within [from_dt, to_dt].
+
+    Example: if 2025-01-01→2025-06-30 is already logged and the requested
+    range is 2025-01-01→2026-04-10, only [(2025-07-01, 2026-04-10)] is returned.
+    """
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return [(from_dt, to_dt)]
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT from_date, to_date FROM fetch_log
+                 WHERE symbol        = %s
+                   AND exchange      = %s
+                   AND interval_type = %s
+                   AND from_date     <= %s
+                   AND to_date       >= %s
+                 ORDER BY from_date
+                """,
+                (
+                    symbol.upper(),
+                    exchange.upper(),
+                    interval,
+                    to_dt.date(),
+                    from_dt.date(),
+                ),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+    except Exception as exc:
+        logger.error("find_missing_date_ranges error for %s: %s", symbol, exc)
+        return [(from_dt, to_dt)]
+
+    if not rows:
+        return [(from_dt, to_dt)]
+
+    covered = sorted((r["from_date"], r["to_date"]) for r in rows)
+
+    gaps: list[tuple[datetime, datetime]] = []
+    current = from_dt.date()
+    end_date = to_dt.date()
+
+    for cov_start, cov_end in covered:
+        if current < cov_start:
+            gap_end = min(cov_start - timedelta(days=1), end_date)
+            gaps.append((_date_to_dt(current, True), _date_to_dt(gap_end, False)))
+        current = max(current, cov_end + timedelta(days=1))
+        if current > end_date:
+            break
+
+    if current <= end_date:
+        gaps.append((_date_to_dt(current, True), _date_to_dt(end_date, False)))
+
+    return gaps
 
 
 def transform(df: pd.DataFrame) -> pd.DataFrame:
@@ -417,15 +543,81 @@ CREATE TABLE IF NOT EXISTS watched_symbols (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
+_CREATE_TICK_DATA_SQL = """
+CREATE TABLE IF NOT EXISTS tick_data (
+    id                   BIGINT UNSIGNED  AUTO_INCREMENT PRIMARY KEY,
+    instrument_token     INT              NOT NULL,
+    symbol               VARCHAR(50)      NOT NULL,
+    exchange             VARCHAR(20)      NOT NULL DEFAULT '',
+    captured_at          DATETIME(3)      NOT NULL,
+    last_price           DECIMAL(14, 4)   NOT NULL,
+    open                 DECIMAL(14, 4),
+    high                 DECIMAL(14, 4),
+    low                  DECIMAL(14, 4),
+    close                DECIMAL(14, 4),
+    volume               BIGINT           DEFAULT 0,
+    buy_quantity         INT              DEFAULT 0,
+    sell_quantity        INT              DEFAULT 0,
+    change_pct           DECIMAL(10, 4),
+    last_traded_quantity INT              DEFAULT 0,
+    avg_traded_price     DECIMAL(14, 4),
+    oi                   BIGINT           DEFAULT 0,
+    oi_day_high          BIGINT           DEFAULT 0,
+    oi_day_low           BIGINT           DEFAULT 0,
+    last_trade_time      DATETIME(3),
+    exchange_timestamp   DATETIME(3),
+    depth                JSON,
+    INDEX idx_symbol_captured (symbol, captured_at),
+    INDEX idx_token_captured  (instrument_token, captured_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+
+_CREATE_INSTRUMENT_MASTER_SQL = """
+CREATE TABLE IF NOT EXISTS instrument_master (
+    instrument_token INT            NOT NULL,
+    exchange         VARCHAR(20)    NOT NULL,
+    tradingsymbol    VARCHAR(50)    NOT NULL,
+    name             VARCHAR(100),
+    expiry           DATE,
+    strike           DECIMAL(14, 4),
+    tick_size        DECIMAL(10, 4),
+    lot_size         INT,
+    instrument_type  VARCHAR(20),
+    segment          VARCHAR(20),
+    exchange_token   INT,
+    last_price       DECIMAL(14, 4),
+    updated_at       DATETIME       DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (instrument_token, exchange),
+    INDEX idx_exchange_symbol (exchange, tradingsymbol)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+_CREATE_ORDER_UPDATES_SQL = """
+CREATE TABLE IF NOT EXISTS order_updates (
+    id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    order_id      VARCHAR(50),
+    status        VARCHAR(50),
+    tradingsymbol VARCHAR(50),
+    exchange      VARCHAR(20),
+    raw_data      JSON,
+    received_at   DATETIME        DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_order_id (order_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
 
 def ensure_tick_tables() -> None:
-    """Create watched_symbols table if it does not exist."""
+    """Create watched_symbols, tick_data, instrument_master, order_updates if they do not exist."""
     try:
         with get_db_connection() as conn:
             if not conn:
                 return
             cursor = conn.cursor()
             cursor.execute(_CREATE_WATCHED_SYMBOLS_SQL)
+            cursor.execute(_CREATE_TICK_DATA_SQL)
+            cursor.execute(_CREATE_INSTRUMENT_MASTER_SQL)
+            cursor.execute(_CREATE_ORDER_UPDATES_SQL)
             conn.commit()
             cursor.close()
     except Exception as exc:
@@ -497,7 +689,7 @@ def remove_watched_symbol(symbol: str, exchange: str = "NSE") -> bool:
 
 def save_ticks(ticks: list[dict]) -> int:
     """
-    Bulk-insert real-time 1-second tick snapshots into stock_data.
+    Bulk-insert real-time tick snapshots into tick_data.
     Returns number of rows inserted.
     """
     if not ticks:
@@ -510,21 +702,46 @@ def save_ticks(ticks: list[dict]) -> int:
                 return 0
             cursor = conn.cursor()
             for t in ticks:
+                depth = t.get("depth")
                 cursor.execute(
                     """
-                    INSERT IGNORE INTO stock_data
-                        (instrument_token, symbol, timestamp, open, high, low, close, volume)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO tick_data
+                        (instrument_token, symbol, exchange, captured_at,
+                         last_price, open, high, low, close,
+                         volume, buy_quantity, sell_quantity, change_pct,
+                         last_traded_quantity, avg_traded_price,
+                         oi, oi_day_high, oi_day_low,
+                         last_trade_time, exchange_timestamp, depth)
+                    VALUES
+                        (%s, %s, %s, %s,
+                         %s, %s, %s, %s, %s,
+                         %s, %s, %s, %s,
+                         %s, %s,
+                         %s, %s, %s,
+                         %s, %s, %s)
                     """,
                     (
                         int(t["instrument_token"]),
                         t["symbol"].upper(),
+                        t.get("exchange", ""),
                         t["captured_at"],
-                        float(t["open"])  if t.get("open")  is not None else float(t["last_price"]),
-                        float(t["high"])  if t.get("high")  is not None else float(t["last_price"]),
-                        float(t["low"])   if t.get("low")   is not None else float(t["last_price"]),
                         float(t["last_price"]),
+                        float(t["open"])             if t.get("open")             is not None else None,
+                        float(t["high"])             if t.get("high")             is not None else None,
+                        float(t["low"])              if t.get("low")              is not None else None,
+                        float(t["close"])            if t.get("close")            is not None else None,
                         int(t.get("volume") or 0),
+                        int(t.get("buy_quantity") or 0),
+                        int(t.get("sell_quantity") or 0),
+                        float(t["change"])           if t.get("change")           is not None else None,
+                        int(t.get("last_traded_quantity") or 0),
+                        float(t["avg_traded_price"]) if t.get("avg_traded_price") is not None else None,
+                        int(t.get("oi") or 0),
+                        int(t.get("oi_day_high") or 0),
+                        int(t.get("oi_day_low") or 0),
+                        t.get("last_trade_time"),
+                        t.get("exchange_timestamp"),
+                        json.dumps(depth) if depth is not None else None,
                     ),
                 )
                 rows_inserted += cursor.rowcount
@@ -535,3 +752,108 @@ def save_ticks(ticks: list[dict]) -> int:
         logger.error(f"save_ticks: {exc}")
 
     return rows_inserted
+
+
+def get_instruments_for_exchange(exchange: str) -> list[dict]:
+    """Return cached instruments for an exchange from instrument_master."""
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return []
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT instrument_token, tradingsymbol FROM instrument_master WHERE exchange = %s",
+                (exchange.upper(),),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            return rows
+    except Exception as exc:
+        logger.error(f"get_instruments_for_exchange: {exc}")
+        return []
+
+
+def upsert_instruments(exchange: str, instruments: list[dict]) -> int:
+    """Upsert a list of instruments from kite.instruments() into instrument_master."""
+    if not instruments:
+        return 0
+    count = 0
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return 0
+            cursor = conn.cursor()
+            for inst in instruments:
+                expiry = inst.get("expiry")
+                if expiry and str(expiry) in ("0000-00-00", ""):
+                    expiry = None
+                cursor.execute(
+                    """
+                    INSERT INTO instrument_master
+                        (instrument_token, exchange, tradingsymbol, name,
+                         expiry, strike, tick_size, lot_size,
+                         instrument_type, segment, exchange_token, last_price)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        tradingsymbol   = VALUES(tradingsymbol),
+                        name            = VALUES(name),
+                        expiry          = VALUES(expiry),
+                        strike          = VALUES(strike),
+                        tick_size       = VALUES(tick_size),
+                        lot_size        = VALUES(lot_size),
+                        instrument_type = VALUES(instrument_type),
+                        segment         = VALUES(segment),
+                        exchange_token  = VALUES(exchange_token),
+                        last_price      = VALUES(last_price),
+                        updated_at      = CURRENT_TIMESTAMP
+                    """,
+                    (
+                        int(inst.get("instrument_token", 0)),
+                        exchange.upper(),
+                        inst.get("tradingsymbol", ""),
+                        inst.get("name", ""),
+                        expiry or None,
+                        float(inst["strike"])       if inst.get("strike")       else None,
+                        float(inst["tick_size"])    if inst.get("tick_size")    else None,
+                        int(inst["lot_size"])       if inst.get("lot_size")     else None,
+                        inst.get("instrument_type", ""),
+                        inst.get("segment", ""),
+                        int(inst["exchange_token"]) if inst.get("exchange_token") else None,
+                        float(inst["last_price"])   if inst.get("last_price")   else None,
+                    ),
+                )
+                count += 1
+            conn.commit()
+            cursor.close()
+    except Exception as exc:
+        logger.error(f"upsert_instruments: {exc}")
+    return count
+
+
+def save_order_update(data: dict) -> int:
+    """Persist a Kite WebSocket order-update event to order_updates. Returns row id."""
+    try:
+        with get_db_connection() as conn:
+            if not conn:
+                return -1
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO order_updates (order_id, status, tradingsymbol, exchange, raw_data)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    data.get("order_id", ""),
+                    data.get("status", ""),
+                    data.get("tradingsymbol", ""),
+                    data.get("exchange", ""),
+                    json.dumps(data),
+                ),
+            )
+            row_id = cursor.lastrowid
+            conn.commit()
+            cursor.close()
+            return row_id
+    except Exception as exc:
+        logger.error(f"save_order_update: {exc}")
+        return -1
